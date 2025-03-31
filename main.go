@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -14,16 +13,22 @@ type Config struct {
 }
 
 type Server struct {
-	config Config
-	ln     net.Listener
+	config      Config
+	ln          net.Listener
+	peers       map[*Peer]bool
+	addPeerChan chan *Peer
+	quitChan    chan struct{}
 }
 
 func NewServer(cfg Config) *Server {
 	if cfg.listenAddr == "" {
-		cfg.listenAddr = ":8080"
+		cfg.listenAddr = ":8082"
 	}
 	return &Server{
-		config: cfg,
+		config:      cfg,
+		peers:       make(map[*Peer]bool),
+		addPeerChan: make(chan *Peer),
+		quitChan:    make(chan struct{}),
 	}
 }
 
@@ -37,8 +42,20 @@ func (s *Server) StartServer() error {
 	slog.Info("Listening on " + s.config.listenAddr)
 	s.ln = ln
 
+	go s.loop()
 	s.acceptConn()
 	return nil
+}
+
+func (s *Server) loop() {
+	for {
+		select {
+		case <-s.quitChan:
+			return
+		case p := <-s.addPeerChan:
+			s.peers[p] = true
+		}
+	}
 }
 
 func (s *Server) acceptConn() {
@@ -54,7 +71,7 @@ func (s *Server) acceptConn() {
 		localConnNum := connectionNum
 
 		slog.Info(fmt.Sprintf("Starting connection #%d", localConnNum))
-		go handleConn(conn, localConnNum)
+		go s.handleConn(conn, localConnNum)
 		/*select {
 		case <-ctx.Done():
 			fmt.Printf("For conn no #%d Context cancelled: %v\n", localConnNum, ctx.Err())
@@ -70,29 +87,23 @@ func timeOutSignal(timeout time.Duration, timeOutSignalChan chan bool) {
 	timeOutSignalChan <- true
 }
 
-func handleConn(conn net.Conn, localConnNum int64) {
+func (s *Server) handleConn(conn net.Conn, localConnNum int64) {
 
-	reqBuffer := make([]byte, 1024)
-	for {
-		reqLen, err := conn.Read(reqBuffer)
-		text := strings.TrimSpace(string(reqBuffer[:reqLen]))
-		if err != nil {
-			slog.Error("Error reading request: " + err.Error())
-		}
-
-		slog.Info("Request received: " + string(reqBuffer[:reqLen]))
-
-		if text == "Good Bye" {
-			slog.Info(fmt.Sprintf("Closing connection #%d gracefully", localConnNum))
-			conn.Close()
-			return
-		}
-		conn.Write([]byte(fmt.Sprintf("Rookie-Redis Connection #%d > ", localConnNum)))
+	peer := NewPeer(conn)
+	s.addPeerChan <- peer
+	slog.Info("new peer connected", "remoteAddr", conn.RemoteAddr())
+	err := peer.readLoop(localConnNum)
+	if err != nil {
+		slog.Error("readLoop", "err", err.Error())
+		return
 	}
+	return
 }
 
 func main() {
-	err := NewServer(Config{listenAddr: ":8080"}).StartServer()
+	InitCommandRegexObjMap()
+	InitCommandFuncMap()
+	err := NewServer(Config{listenAddr: ":8082"}).StartServer()
 	slog.Info("server stopped")
 	if err != nil {
 		panic(err)
